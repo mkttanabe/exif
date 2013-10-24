@@ -117,11 +117,19 @@ struct _tagNodeInfo {
  */
 
 // error status
-#define ERR_READ_FILE           -1
-#define ERR_WRITE_FILE          -2
-#define ERR_INVALID_JPEG        -3
-#define ERR_INVALID_APP1HEADER  -4
-#define ERR_INVALID_IFD         -5
+#define ERR_READ_FILE            -1
+#define ERR_WRITE_FILE           -2
+#define ERR_INVALID_JPEG         -3
+#define ERR_INVALID_APP1HEADER   -4
+#define ERR_INVALID_IFD          -5
+#define ERR_INVALID_ID           -6
+#define ERR_INVALID_TYPE         -7
+#define ERR_INVALID_COUNT        -8
+#define ERR_INVALID_POINTER      -9
+#define ERR_NOT_EXIST           -10
+#define ERR_ALREADY_EXIST       -11
+#define ERR_UNKNOWN             -12
+#define ERR_MEMALLOC            -13
 
 // public funtions
 
@@ -263,6 +271,233 @@ TagNodeInfo *getTagInfoFromIfd(void *ifd, unsigned short tagId);
  *  [in] tag : target TagNodeInfo
  */
 void freeTagInfo(void *tag);
+
+/**
+ * queryTagNodeIsExist()
+ *
+ * Query if the specified tag node is exist in the IFD tables
+ *
+ * parameters
+ *  [in] ifdTableArray: address of the IFD tables array
+ *  [in] ifdType : target IFD type
+ *  [in] tagId : target tag ID
+ *
+ * return
+ *  0: not exist
+ *  1: exist
+ */
+int queryTagNodeIsExist(void **ifdTableArray,
+                        IFD_TYPE ifdType,
+                        unsigned short tagId);
+
+/**
+ * createTagInfo()
+ *
+ * Create new TagNodeInfo block
+ *
+ * parameters
+ *  [in] tagId: id of the tag
+ *  [in] type: type of the tag
+ *  [in] count: data count of the tag
+ *  [out] pResult : error status
+ *   0: OK
+ *  -n: error
+ *      ERR_INVALID_TYPE
+ *      ERR_INVALID_COUNT
+ *      ERR_MEMALLOC
+ *
+ * return
+ *  NULL: error
+ * !NULL: address of the newly created TagNodeInfo
+ */
+TagNodeInfo *createTagInfo(unsigned short tagId,
+                           unsigned short type,
+                           unsigned int count,
+                           int *pResult);
+
+/**
+ * removeIfdTableFromIfdTableArray()
+ *
+ * Remove the IFD table from the ifdTableArray
+ *
+ * parameters
+ *  [in] ifdTableArray: address of the IFD tables array
+ *  [in] ifdType : target IFD type
+ *
+ * return
+ *  n: number of the removed IFD tables
+ */
+int removeIfdTableFromIfdTableArray(void **ifdTableArray, IFD_TYPE ifdType);
+
+/**
+ * insertIfdTableToIfdTableArray()
+ *
+ * Insert new IFD table to the ifdTableArray
+ *
+ * parameters
+ *  [in] ifdTableArray: address of the IFD tables array
+ *  [in] ifdType : target IFD type
+ *  [out] pResult : result status
+ *   0: OK
+ *  -n: error
+ *      ERR_INVALID_POINTER
+ *      ERR_ALREADY_EXIST
+ *      ERR_MEMALLOC
+ *
+ * return
+ *  NULL: error
+ * !NULL: address of the newly created ifdTableArray
+ *
+ * note
+ * This function frees old ifdTableArray if is not NULL.
+ */
+void **insertIfdTableToIfdTableArray(void **ifdTableArray,
+                                     IFD_TYPE ifdType,
+                                     int *pResult);
+
+/**
+ * removeTagNodeFromIfdTableArray()
+ *
+ * Remove the specified tag node from the IFD table
+ *
+ * parameters
+ *  [in] ifdTableArray: address of the IFD tables array
+ *  [in] ifdType : target IFD type
+ *  [in] tagId : target tag ID
+ *
+ * return
+ *  n: number of the removed tags
+ */
+int removeTagNodeFromIfdTableArray(void **ifdTableArray,
+                             IFD_TYPE ifdType,
+                             unsigned short tagId);
+
+/**
+ * insertTagNodeToIfdTableArray()
+ *
+ * Insert the specified tag node to the IFD table
+ *
+ * parameters
+ *  [in] ifdTableArray: address of the IFD tables array
+ *  [in] ifdType : target IFD type
+ *  [in] tagNodeInfo: address of the TagNodeInfo
+ *
+ * note
+ * This function uses the copy of the specified tag data.
+ * The caller must free it after this function returns.
+ *
+ * return
+ *  0: OK
+ *  ERR_INVALID_POINTER:
+ *  ERR_NOT_EXIST:
+ *  ERR_ALREADY_EXIST:
+ *  ERR_UNKNOWN:
+ */
+int insertTagNodeToIfdTableArray(void **ifdTableArray,
+                             IFD_TYPE ifdType,
+                             TagNodeInfo *tagNodeInfo);
+
+/**
+ * getThumbnailDataOnIfdTableArray()
+ *
+ * Get a copy of the thumbnail data from the 1st IFD table
+ *
+ * parameters
+ *  [in] ifdTableArray : address of the IFD tables array
+ *  [out] pLength : returns the length of the thumbnail data
+ *  [out] pResult : result status
+ *   0: OK
+ *  -n: error
+ *      ERR_INVALID_POINTER
+ *      ERR_MEMALLOC
+ *      ERR_NOT_EXIST
+ *
+ * return
+ *  NULL: error
+ * !NULL: the thumbnail data
+ *
+ * note
+ * This function returns the copy of the thumbnail data.
+ * The caller must free it.
+ */
+unsigned char *getThumbnailDataOnIfdTableArray(void **ifdTableArray,
+                                               unsigned int *pLength,
+                                               int *pResult);
+
+/**
+ * setThumbnailDataOnIfdTableArray()
+ *
+ * Set or update the thumbnail data to the 1st IFD table
+ *
+ * parameters
+ *  [in] ifdTableArray : address of the IFD tables array
+ *  [in] pData : thumbnail data
+ *  [in] length : thumbnail data length
+ *
+ * note
+ * This function creates the copy of the specified data.
+ * The caller must free it after this function returns.
+ *
+ * return
+ *   0: OK
+ *  -n: error
+ *      ERR_INVALID_POINTER
+ *      ERR_MEMALLOC
+ *      ERR_UNKNOWN
+ */
+int setThumbnailDataOnIfdTableArray(void **ifdTableArray,
+                                    unsigned char *pData,
+                                    unsigned int length);
+
+void getIfdTableDump(void *pIfd, char **pp);
+
+
+/**
+ * updateExifSegmentInJPEGFile()
+ *
+ * Update the Exif segment in a JPEG file
+ *
+ * parameters
+ *  [in] inJPEGFileName : original JPEG file
+ *  [in] outJPGEFileName : output JPEG file
+ *  [in] ifdTableArray : address of the IFD tables array
+ *
+ * return
+ *   1: OK
+ *  -n: error
+ *      ERR_READ_FILE
+ *      ERR_WRITE_FILE
+ *      ERR_INVALID_JPEG
+ *      ERR_INVALID_APP1HEADER
+ *      ERR_INVALID_POINTER
+ *      ERROR_UNKNOWN:
+ */
+int updateExifSegmentInJPEGFile(const char *inJPEGFileName,
+                                const char *outJPGEFileName,
+                                void **ifdTableArray);
+
+void getIfdTableDump(void *pIfd, char **pp);
+
+/**
+ * removeAdobeMetadataSegmentFromJPEGFile()
+ *
+ * Remove Adobe's XMP metadata segment from a JPEG file
+ *
+ * parameters
+ *  [in] inJPEGFileName : original JPEG file
+ *  [in] outJPGEFileName : output JPEG file
+ *
+ * return
+ *   1: OK
+ *   0: Adobe's metadata segment is not found
+ *  -n: error
+ *      ERR_READ_FILE
+ *      ERR_WRITE_FILE
+ *      ERR_INVALID_JPEG
+ *      ERR_INVALID_APP1HEADER
+ */
+int removeAdobeMetadataSegmentFromJPEGFile(const char *inJPEGFileName,
+                                           const char *outJPGEFileName);
 
 // Tag IDs
 // 0th IFD, 1st IFD, Exif IFD

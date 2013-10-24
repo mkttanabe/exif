@@ -16,10 +16,12 @@
 
 #ifdef _MSC_VER
 #include <windows.h>
+#define vsnprintf _vsnprintf
 #endif
 #include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <memory.h>
 #include <ctype.h>
@@ -27,7 +29,7 @@
 
 #pragma pack(2)
 
-#define VERSION  "1.0.0"
+#define VERSION  "1.0.1"
 
 // TIFF Header
 typedef struct _tiff_Header {
@@ -72,6 +74,9 @@ struct _ifdTable {
     unsigned short tagCount;
     TagNode *tags;
     unsigned int nextIfdOffset;
+    unsigned short offset;
+    unsigned short length;
+    unsigned char *p;
 };
 
 static int init(FILE*);
@@ -83,9 +88,24 @@ static TagNode *getTagNodePtrFromIfd(IfdTable*, unsigned short);
 static TagNode *duplicateTagNode(TagNode*);
 static void freeTagNode(void*);
 static char *getTagName(int, unsigned short);
+static int countIfdTableOnIfdTableArray(void **ifdTableArray);
+static IfdTable *getIfdTableFromIfdTableArray(void **ifdTableArray, IFD_TYPE ifdType);
+static void *createIfdTable(IFD_TYPE IfdType, unsigned short tagCount, unsigned int nextOfs);
+static void *addTagNodeToIfd(void *pIfd, unsigned short tagId, unsigned short type,
+                      unsigned int count, unsigned int *numData,unsigned char *byteData);
+static int writeExifSegment(FILE *fp, void **ifdTableArray);
+static int removeTagOnIfd(void *pIfd, unsigned short tagId);
+static int fixLengthAndOffsetInIfdTables(void **ifdTableArray);
+static int setSingleNumDataToTag(TagNode *tag, unsigned int value);
+static int getApp1StartOffset(FILE *fp, const char *App1IDString,
+                              size_t App1IDStringLength, int *pDQTOffset);
+static unsigned short swab16(unsigned short us);
+static void PRINTF(char **ms, const char *fmt, ...);
+static void _dumpIfdTable(void *pIfd, char **p);
 
 static int Verbose = 0;
 static int App1StartOffset = -1;
+static int JpegDQTOffset = -1;
 static APP1_HEADER App1Header;
 
 // public funtions
@@ -141,7 +161,7 @@ int removeExifSegmentFromJPEGFile(const char *inJPEGFileName,
     }
     fpw = fopen(outJPGEFileName, "wb");
     if (!fpw) {
-        sts = ERR_READ_FILE;
+        sts = ERR_WRITE_FILE;
         goto DONE;
     }
     // copy the data in front of the Exif segment
@@ -262,27 +282,32 @@ void **createIfdTableArray(const char *JPEGFileName, int *result)
     tag = getTagNodePtrFromIfd(ifd_0th, TAG_ExifIFDPointer);
     if (tag && !tag->error) {
         ifdOffset = tag->numData[0];
-        ifd_exif = parseIFD(fp, ifdOffset, IFD_EXIF);
-        if (ifd_exif) {
-            ifdArray[ifdCount++] = ifd_exif;
-            tag = getTagNodePtrFromIfd(ifd_exif, TAG_InteroperabilityIFDPointer);
-            if (tag && !tag->error) {
-                ifdOffset = tag->numData[0];
-                ifd_io = parseIFD(fp, ifdOffset, IFD_IO);
-                if (ifd_io) {
-                    ifdArray[ifdCount++] = ifd_io;
-                } else {
-                    if (Verbose) {
-                        printf(FMT_ERR, "Interoperability");
+        if (ifdOffset != 0) {
+            ifd_exif = parseIFD(fp, ifdOffset, IFD_EXIF);
+            if (ifd_exif) {
+                ifdArray[ifdCount++] = ifd_exif;
+                // for InteroperabilityIFDPointer IFD
+                tag = getTagNodePtrFromIfd(ifd_exif, TAG_InteroperabilityIFDPointer);
+                if (tag && !tag->error) {
+                    ifdOffset = tag->numData[0];
+                    if (ifdOffset != 0) {
+                        ifd_io = parseIFD(fp, ifdOffset, IFD_IO);
+                        if (ifd_io) {
+                            ifdArray[ifdCount++] = ifd_io;
+                        } else {
+                            if (Verbose) {
+                                printf(FMT_ERR, "Interoperability");
+                            }
+                            sts = ERR_INVALID_IFD;
+                        }
                     }
-                    sts = ERR_INVALID_IFD;
                 }
+            } else {
+                if (Verbose) {
+                    printf(FMT_ERR, "Exif");
+                }
+                sts = ERR_INVALID_IFD;
             }
-        } else {
-            if (Verbose) {
-                printf(FMT_ERR, "Exif");
-            }
-            sts = ERR_INVALID_IFD;
         }
     }
 
@@ -290,14 +315,16 @@ void **createIfdTableArray(const char *JPEGFileName, int *result)
     tag = getTagNodePtrFromIfd(ifd_0th, TAG_GPSInfoIFDPointer);
     if (tag && !tag->error) {
         ifdOffset = tag->numData[0];
-        ifd_gps = parseIFD(fp, ifdOffset, IFD_GPS);
-        if (ifd_gps) {
-            ifdArray[ifdCount++] = ifd_gps;
-        } else {
-            if (Verbose) {
-                printf(FMT_ERR, "GPS");
+        if (ifdOffset != 0) {
+            ifd_gps = parseIFD(fp, ifdOffset, IFD_GPS);
+            if (ifd_gps) {
+                ifdArray[ifdCount++] = ifd_gps;
+            } else {
+                if (Verbose) {
+                    printf(FMT_ERR, "GPS");
+                }
+                sts = ERR_INVALID_IFD;
             }
-            sts = ERR_INVALID_IFD;
         }
     }
 
@@ -376,7 +403,21 @@ IFD_TYPE getIfdType(void *pIfd)
  * parameters
  *  [in] ifd: target IFD
  */
+
 void dumpIfdTable(void *pIfd)
+{
+    _dumpIfdTable(pIfd, NULL);
+}
+
+void getIfdTableDump(void *pIfd, char **pp)
+{
+    if (pp) {
+        *pp = NULL;
+    }
+    _dumpIfdTable(pIfd, pp);
+}
+
+static void _dumpIfdTable(void *pIfd, char **p)
 {
     int i;
     IfdTable *ifd;
@@ -390,7 +431,7 @@ void dumpIfdTable(void *pIfd)
     }
     ifd = (IfdTable*)pIfd;
 
-    printf("\n{%s IFD}",
+    PRINTF(p, "\n{%s IFD}",
         (ifd->ifdType == IFD_0TH)  ? "0TH" :
         (ifd->ifdType == IFD_1ST)  ? "1ST" :
         (ifd->ifdType == IFD_EXIF) ? "EXIF" :
@@ -398,57 +439,57 @@ void dumpIfdTable(void *pIfd)
         (ifd->ifdType == IFD_IO)   ? "Interoperability" : "");
 
     if (Verbose) {
-        printf(" tags=%u\n", ifd->tagCount);
+        PRINTF(p, " tags=%u\n", ifd->tagCount);
     } else {
-        printf("\n");
+        PRINTF(p, "\n");
     }
 
     tag = ifd->tags;
     while (tag) {
         if (Verbose) {
-            printf("tag[%02d] 0x%04X %s\n",
+            PRINTF(p, "tag[%02d] 0x%04X %s\n",
                 cnt++, tag->tagId, getTagName(ifd->ifdType, tag->tagId));
-            printf("\ttype=%u count=%u ", tag->type, tag->count);
-            printf("val=");
+            PRINTF(p, "\ttype=%u count=%u ", tag->type, tag->count);
+            PRINTF(p, "val=");
         } else {
             strcpy(tagName, getTagName(ifd->ifdType, tag->tagId));
-            printf(" - %s: ", (strlen(tagName) > 0) ? tagName : "(unknown)");
+            PRINTF(p, " - %s: ", (strlen(tagName) > 0) ? tagName : "(unknown)");
         }
         if (tag->error) {
-            printf("(error)");
+            PRINTF(p, "(error)");
         } else {
             switch (tag->type) {
             case TYPE_BYTE:
                 for (i = 0; i < (int)tag->count; i++) {
-                    printf("%u ", (unsigned char)tag->numData[i]);
+                    PRINTF(p, "%u ", (unsigned char)tag->numData[i]);
                 }
                 break;
 
             case TYPE_ASCII:
-                printf("[%s]", (char*)tag->byteData);
+                PRINTF(p, "[%s]", (char*)tag->byteData);
                 break;
 
             case TYPE_SHORT:
                 for (i = 0; i < (int)tag->count; i++) {
-                    printf("%hu ", (unsigned short)tag->numData[i]);
+                    PRINTF(p, "%hu ", (unsigned short)tag->numData[i]);
                 }
                 break;
 
             case TYPE_LONG:
                 for (i = 0; i < (int)tag->count; i++) {
-                    printf("%u ", tag->numData[i]);
+                    PRINTF(p, "%u ", tag->numData[i]);
                 }
                 break;
 
             case TYPE_RATIONAL:
                 for (i = 0; i < (int)tag->count; i++) {
-                    printf("%u/%u ", tag->numData[i*2], tag->numData[i*2+1]);
+                    PRINTF(p, "%u/%u ", tag->numData[i*2], tag->numData[i*2+1]);
                 }
                 break;
 
             case TYPE_SBYTE:
                 for (i = 0; i < (int)tag->count; i++) {
-                    printf("%d ", (char)tag->numData[i]);
+                    PRINTF(p, "%d ", (char)tag->numData[i]);
                 }
                 break;
 
@@ -461,31 +502,31 @@ void dumpIfdTable(void *pIfd)
                 for (i = 0; i < (int)count; i++) {
                     // if character is printable
                     if (isgraph(tag->byteData[i])) {
-                        printf("%c ", tag->byteData[i]);
+                        PRINTF(p, "%c ", tag->byteData[i]);
                     } else {
-                        printf("0x%02x ", tag->byteData[i]);
+                        PRINTF(p, "0x%02x ", tag->byteData[i]);
                     }
                 }
                 if (count < tag->count) {
-                    printf("(omitted)");
+                    PRINTF(p, "(omitted)");
                 }
                 break;
 
             case TYPE_SSHORT:
                 for (i = 0; i < (int)tag->count; i++) {
-                    printf("%hd ", (short)tag->numData[i]);
+                    PRINTF(p, "%hd ", (short)tag->numData[i]);
                 }
                 break;
 
             case TYPE_SLONG:
                 for (i = 0; i < (int)tag->count; i++) {
-                    printf("%d ", (int)tag->numData[i]);
+                    PRINTF(p, "%d ", (int)tag->numData[i]);
                 }
                 break;
 
             case TYPE_SRATIONAL:
                 for (i = 0; i < (int)tag->count; i++) {
-                    printf("%d/%d ", (int)tag->numData[i*2], (int)tag->numData[i*2+1]);
+                    PRINTF(p, "%d/%d ", (int)tag->numData[i*2], (int)tag->numData[i*2+1]);
                 }
                 break;
 
@@ -493,7 +534,7 @@ void dumpIfdTable(void *pIfd)
                 break;
             }
         }
-        printf("\n");
+        PRINTF(p, "\n");
 
         tag = tag->next;
     }
@@ -558,7 +599,7 @@ TagNodeInfo *getTagInfo(void **ifdArray,
  * Get the TagNodeInfo that matches the TagId
  *
  * parameters
- *  [in] ifd : target IFD
+ *  [in] ifd : target IFD table
  *  [in] tagId : target tag ID
  *
  * return
@@ -587,6 +628,664 @@ void freeTagInfo(void *tag)
     freeTagNode(tag);
 }
 
+/**
+ * queryTagNodeIsExist()
+ *
+ * Query if the specified tag node is exist in the IFD tables
+ *
+ * parameters
+ *  [in] ifdTableArray: address of the IFD tables array
+ *  [in] ifdType : target IFD type
+ *  [in] tagId : target tag ID
+ *
+ * return
+ *  0: not exist
+ *  1: exist
+ */
+int queryTagNodeIsExist(void **ifdTableArray,
+                        IFD_TYPE ifdType,
+                        unsigned short tagId)
+{
+    IfdTable *ifd;
+    TagNode *tag;
+    if (!ifdTableArray) {
+        return 0;
+    }
+    ifd = getIfdTableFromIfdTableArray(ifdTableArray, ifdType);
+    if (!ifd) {
+        return 0;
+    }
+    tag = getTagNodePtrFromIfd(ifd, tagId);
+    if (!tag) {
+        return 0;
+    }
+    return 1;
+}
+
+/**
+ * createTagInfo()
+ *
+ * Create new TagNodeInfo block
+ *
+ * parameters
+ *  [in] tagId: id of the tag
+ *  [in] type: type of the tag
+ *  [in] count: data count of the tag
+ *  [out] pResult : error status
+ *   0: OK
+ *  -n: error
+ *      ERR_INVALID_TYPE
+ *      ERR_INVALID_COUNT
+ *      ERR_MEMALLOC
+ *
+ * return
+ *  NULL: error
+ * !NULL: address of the newly created TagNodeInfo
+ */
+TagNodeInfo *createTagInfo(unsigned short tagId,
+                           unsigned short type,
+                           unsigned int count,
+                           int *pResult)
+{
+    TagNode *tag;
+    if (type < TYPE_BYTE || type > TYPE_SRATIONAL) {
+        if (pResult) {
+            *pResult = ERR_INVALID_TYPE;
+        }
+        return NULL;
+    }
+    if (count <= 0) {
+        if (pResult) {
+            *pResult = ERR_INVALID_COUNT;
+        }
+        return NULL;
+    }
+    tag = (TagNode*)malloc(sizeof(TagNode));
+    if (!tag) {
+        if (pResult) {
+            *pResult = ERR_MEMALLOC;
+        }
+        return NULL;
+    }
+    memset(tag, 0, sizeof(TagNode));
+    tag->tagId = tagId;
+    tag->type = type;
+    tag->count = count;
+
+    if (type == TYPE_ASCII || type == TYPE_UNDEFINED) {
+        tag->byteData = (unsigned char*)malloc(count*sizeof(char));
+    }
+    else if (type == TYPE_BYTE   ||
+             type == TYPE_SBYTE  ||
+             type == TYPE_SHORT  ||
+             type == TYPE_LONG   ||
+             type == TYPE_SSHORT ||
+             type == TYPE_SLONG) {
+        tag->numData = (unsigned int*)malloc(count*sizeof(int));
+    }
+    else if (type == TYPE_RATIONAL ||
+             type == TYPE_SRATIONAL) {
+        tag->numData = (unsigned int*)malloc(count*sizeof(int)*2);
+    }
+    if (pResult) {
+        *pResult = 0;
+    }
+    return (TagNodeInfo*)tag;
+}
+
+/**
+ * removeIfdTableFromIfdTableArray()
+ *
+ * Remove the IFD table from the ifdTableArray
+ *
+ * parameters
+ *  [in] ifdTableArray: address of the IFD tables array
+ *  [in] ifdType : target IFD type
+ *
+ * return
+ *  n: number of the removed IFD tables
+ */
+int removeIfdTableFromIfdTableArray(void **ifdTableArray, IFD_TYPE ifdType)
+{
+    int i, num = 0, ret = 0;
+    if (!ifdTableArray) {
+        return 0;
+    }
+    // count IFD tables
+    num = countIfdTableOnIfdTableArray(ifdTableArray);
+    for (;;) { // possibility of multiple entries
+        for (i = 0; i < num; i++) {
+            IfdTable *ifd = ifdTableArray[i];
+            if (ifd->ifdType == ifdType) {
+                freeIfdTable(ifd);
+                ifdTableArray[i] = NULL;
+                ret++;
+                break;
+            }
+        }
+        if (i == num) {
+            break; // no more found
+        }
+        // left justify the array
+        memcpy(&ifdTableArray[i], &ifdTableArray[i+1], (num-i) * sizeof(void*));
+        num--;
+    }
+    return ret;
+}
+
+/**
+ * insertIfdTableToIfdTableArray()
+ *
+ * Insert new IFD table to the ifdTableArray
+ *
+ * parameters
+ *  [in] ifdTableArray: address of the IFD tables array
+ *  [in] ifdType : target IFD type
+ *  [out] pResult : error status
+ *   0: OK
+ *  -n: error
+ *      ERR_ALREADY_EXIST
+ *      ERR_MEMALLOC
+ *
+ * return
+ *  NULL: error
+ * !NULL: address of the newly created ifdTableArray
+ *
+ * note
+ * This function frees old ifdTableArray if is not NULL.
+ */
+void **insertIfdTableToIfdTableArray(void **ifdTableArray,
+                                     IFD_TYPE ifdType,
+                                     int *pResult)
+{
+    void *newIfd;
+    void **newIfdTableArray;
+    int num = 0;
+    if (!ifdTableArray) {
+        num = 0;
+    } else {
+        num = countIfdTableOnIfdTableArray(ifdTableArray);
+    }
+    if (num > 0 && getIfdTableFromIfdTableArray(ifdTableArray, ifdType) != NULL) {
+        if (pResult) {
+            *pResult = ERR_ALREADY_EXIST;
+        }
+        return NULL;
+    }
+    // create the new IFD table
+    newIfd = createIfdTable(ifdType, 0, 0);
+    if (!newIfd) {
+        if (pResult) {
+            *pResult = ERR_MEMALLOC;
+        }
+        return NULL;
+    }
+    // copy existing IFD tables to the new array
+    newIfdTableArray = (void**)malloc(sizeof(void*)*(num+2));
+    if (!newIfdTableArray) {
+        if (pResult) {
+            *pResult = ERR_MEMALLOC;
+        }
+        free(newIfd);
+        return NULL;
+    }
+    memset(newIfdTableArray, 0, sizeof(void*)*(num+2));
+    if (num > 0) {
+        memcpy(newIfdTableArray, ifdTableArray, num * sizeof(void*));
+    }
+    // add the new IFD table
+    newIfdTableArray[num] = newIfd;
+    if (ifdTableArray) {
+        free(ifdTableArray); // free the old array
+    }
+    if (pResult) {
+        *pResult = 0;
+    }
+    return newIfdTableArray;
+}
+
+/**
+ * removeTagNodeFromIfdTableArray()
+ *
+ * Remove the specified tag node from the IFD table
+ *
+ * parameters
+ *  [in] ifdTableArray: address of the IFD tables array
+ *  [in] ifdType : target IFD type
+ *  [in] tagId : target tag ID
+ *
+ * return
+ *  n: number of the removed tags
+ */
+int removeTagNodeFromIfdTableArray(void **ifdTableArray,
+                             IFD_TYPE ifdType,
+                             unsigned short tagId)
+{
+    IfdTable *ifd = getIfdTableFromIfdTableArray(ifdTableArray, ifdType);
+    if (!ifd) {
+        return 0;
+    }
+    return removeTagOnIfd(ifd, tagId);
+}
+
+/**
+ * insertTagNodeToIfdTableArray()
+ *
+ * Insert the specified tag node to the IFD table
+ *
+ * parameters
+ *  [in] ifdTableArray: address of the IFD tables array
+ *  [in] ifdType : target IFD type
+ *  [in] tagNodeInfo: address of the TagNodeInfo
+ *
+ * note
+ * This function uses the copy of the specified tag data.
+ * The caller must free it after this function returns.
+ *
+ * return
+ *  0: OK
+ *  ERR_INVALID_POINTER:
+ *  ERR_NOT_EXIST:
+ *  ERR_ALREADY_EXIST:
+ *  ERR_UNKNOWN:
+ */
+int insertTagNodeToIfdTableArray(void **ifdTableArray,
+                             IFD_TYPE ifdType,
+                             TagNodeInfo *tagNodeInfo)
+{
+    IfdTable *ifd;
+    if (!ifdTableArray) {
+        return ERR_INVALID_POINTER;
+    }
+    if (!tagNodeInfo) {
+        return ERR_INVALID_POINTER;
+    }
+    ifd = getIfdTableFromIfdTableArray(ifdTableArray, ifdType);
+    if (!ifd) {
+        return ERR_NOT_EXIST;
+    }
+    // already exists the same type entry
+    if (getTagNodePtrFromIfd(ifd, tagNodeInfo->tagId) != NULL) {
+        return ERR_ALREADY_EXIST;
+    }
+    // add to the IFD table
+    if (!addTagNodeToIfd(ifd, 
+                    tagNodeInfo->tagId,
+                    tagNodeInfo->type,
+                    tagNodeInfo->count,
+                    tagNodeInfo->numData,
+                    tagNodeInfo->byteData)) {
+        return ERR_UNKNOWN;
+    }
+    ifd->tagCount++;
+    return 0;
+}
+
+/**
+ * getThumbnailDataOnIfdTableArray()
+ *
+ * Get a copy of the thumbnail data from the 1st IFD table
+ *
+ * parameters
+ *  [in] ifdTableArray : address of the IFD tables array
+ *  [out] pLength : returns the length of the thumbnail data
+ *  [out] pResult : error status
+ *   0: OK
+ *  -n: error
+ *      ERR_INVALID_POINTER
+ *      ERR_MEMALLOC
+ *      ERR_NOT_EXIST
+ *
+ * return
+ *  NULL: error
+ * !NULL: the thumbnail data
+ *
+ * note
+ * This function returns the copy of the thumbnail data.
+ * The caller must free it.
+ */
+unsigned char *getThumbnailDataOnIfdTableArray(void **ifdTableArray,
+                                               unsigned int *pLength,
+                                               int *pResult)
+{
+    IfdTable *ifd;
+    TagNode *tag;
+    unsigned int len;
+    unsigned char *retp;
+    if (!ifdTableArray || !pLength) {
+        if (pResult) {
+            *pResult = ERR_INVALID_POINTER;
+        }
+        return NULL;
+    }
+    ifd = getIfdTableFromIfdTableArray(ifdTableArray, IFD_1ST);
+    if (!ifd || !ifd->p) {
+        if (pResult) {
+            *pResult = ERR_NOT_EXIST;
+        }
+        return NULL;
+    }
+    tag = getTagNodePtrFromIfd(ifd, TAG_JPEGInterchangeFormatLength);
+    if (!tag || tag->error) {
+        if (pResult) {
+            *pResult = ERR_NOT_EXIST;
+        }
+        return NULL;
+    }
+    len = tag->numData[0];
+    if (len <= 0) {
+        if (pResult) {
+            *pResult = ERR_NOT_EXIST;
+        }
+        return NULL;
+    }
+    retp= (unsigned char*)malloc(len);
+    if (!retp) {
+        if (pResult) {
+            *pResult = ERR_MEMALLOC;
+        }
+        return NULL;
+    }
+    memcpy(retp, ifd->p, len);
+    *pLength = len;
+    if (pResult) {
+        *pResult = 0;
+    }
+    return retp;
+}
+
+/**
+ * setThumbnailDataOnIfdTableArray()
+ *
+ * Set or update the thumbnail data to the 1st IFD table
+ *
+ * parameters
+ *  [in] ifdTableArray : address of the IFD tables array
+ *  [in] pData : thumbnail data
+ *  [in] length : thumbnail data length
+ *
+ * note
+ * This function creates the copy of the specified data.
+ * The caller must free it after this function returns.
+ *
+ * return
+ *   0: OK
+ *  -n: error
+ *      ERR_INVALID_POINTER
+ *      ERR_MEMALLOC
+ *      ERR_UNKNOWN
+ */
+int setThumbnailDataOnIfdTableArray(void **ifdTableArray,
+                                    unsigned char *pData,
+                                    unsigned int length)
+{
+    IfdTable *ifd;
+    TagNode *tag;
+    unsigned int zero = 0;
+    if (!ifdTableArray || !pData || length <= 0) {
+        return ERR_INVALID_POINTER;
+    }
+    ifd = getIfdTableFromIfdTableArray(ifdTableArray, IFD_1ST);
+    if (!ifd) {
+        return ERR_NOT_EXIST;
+    }
+    if (ifd->p) {
+        free(ifd->p);
+    }
+    // set thumbnail length;
+    tag = getTagNodePtrFromIfd(ifd, TAG_JPEGInterchangeFormatLength);
+    if (tag) {
+        setSingleNumDataToTag(tag, length);
+    } else {
+        if (!addTagNodeToIfd(ifd, TAG_JPEGInterchangeFormatLength,
+                            TYPE_LONG, 1, &length, NULL)) {
+            return ERR_UNKNOWN;
+        }
+    }
+    tag = getTagNodePtrFromIfd(ifd, TAG_JPEGInterchangeFormat);
+    if (tag) {
+        setSingleNumDataToTag(tag, zero);
+    } else {
+        // add thumbnail offset tag if not exist
+        addTagNodeToIfd(ifd, TAG_JPEGInterchangeFormat,
+                            TYPE_LONG, 1, &zero, NULL);
+    }
+    ifd->p = (unsigned char*)malloc(length);
+    if (!ifd->p) {
+        return ERR_MEMALLOC;
+    }
+    memcpy(ifd->p, pData, length);
+    return 0;
+}
+
+/**
+ * updateExifSegmentInJPEGFile()
+ *
+ * Update the Exif segment in a JPEG file
+ *
+ * parameters
+ *  [in] inJPEGFileName : original JPEG file
+ *  [in] outJPGEFileName : output JPEG file
+ *  [in] ifdTableArray : address of the IFD tables array
+ *
+ * return
+ *   1: OK
+ *  -n: error
+ *      ERR_READ_FILE
+ *      ERR_WRITE_FILE
+ *      ERR_INVALID_JPEG
+ *      ERR_INVALID_APP1HEADER
+ *      ERR_INVALID_POINTER
+ *      ERROR_UNKNOWN:
+ */
+int updateExifSegmentInJPEGFile(const char *inJPEGFileName,
+                                const char *outJPGEFileName,
+                                void **ifdTableArray)
+{
+    int ofs;
+    int i, sts = 1, hasExifSegment;
+    size_t readLen, writeLen;
+    unsigned char buf[8192], *p;
+    FILE *fpr = NULL, *fpw = NULL;
+
+    // refresh the length and offset variables in the IFD table
+    sts = fixLengthAndOffsetInIfdTables(ifdTableArray);
+    if (sts != 0) {
+        goto DONE;
+    }
+    fpr = fopen(inJPEGFileName, "rb");
+    if (!fpr) {
+        sts = ERR_READ_FILE;
+        goto DONE;
+    }
+    sts = init(fpr);
+    if (sts < 0) {
+        goto DONE;
+    }
+    if (sts == 0) {
+        hasExifSegment = 0;
+        ofs = JpegDQTOffset;
+    } else {
+        hasExifSegment = 1;
+        ofs = App1StartOffset;
+    }
+    fpw = fopen(outJPGEFileName, "wb");
+    if (!fpw) {
+        sts = ERR_WRITE_FILE;
+        goto DONE;
+    }
+    // copy the data in front of the Exif segment
+    rewind(fpr);
+    p = buf;
+    if (ofs > sizeof(buf)) {
+        // allocate new buffer if needed
+        p = (unsigned char*)malloc(ofs);
+    }
+    if (!p) {
+        for (i = 0; i < ofs; i++) {
+            fread(buf, 1, sizeof(char), fpr);
+            fwrite(buf, 1, sizeof(char), fpw);
+        }
+    } else {
+        if (fread(p, 1, ofs, fpr) < (size_t)ofs) {
+            sts = ERR_READ_FILE;
+            goto DONE;
+        }
+        if (fwrite(p, 1, ofs, fpw) < (size_t)ofs) {
+            sts = ERR_WRITE_FILE;
+            goto DONE;
+        }
+        if (p != &buf[0]) {
+            free(p);
+        }
+    }
+    // write new Exif segment
+    sts = writeExifSegment(fpw, ifdTableArray);
+    if (sts != 0) {
+        goto DONE;
+    }
+    sts = 1;
+    if (hasExifSegment) {
+        // seek to the end of the Exif segment
+        ofs = App1StartOffset + sizeof(App1Header.marker) + App1Header.length;
+        if (fseek(fpr, ofs, SEEK_SET) != 0) {
+            sts = ERR_READ_FILE;
+            goto DONE;
+        }
+    }
+    // read & write
+    for (;;) {
+        readLen = fread(buf, 1, sizeof(buf), fpr);
+        if (readLen <= 0) {
+            break;
+        }
+        writeLen = fwrite(buf, 1, readLen, fpw);
+        if (writeLen != readLen) {
+            sts = ERR_WRITE_FILE;
+            goto DONE;
+        }
+    }
+DONE:
+    if (fpw) {
+        fclose(fpw);
+    }
+    if (fpr) {
+        fclose(fpr);
+    }
+    return sts;
+}
+
+/**
+ * removeAdobeMetadataSegmentFromJPEGFile()
+ *
+ * Remove Adobe's XMP metadata segment from a JPEG file
+ *
+ * parameters
+ *  [in] inJPEGFileName : original JPEG file
+ *  [in] outJPGEFileName : output JPEG file
+ *
+ * return
+ *   1: OK
+ *   0: Adobe's metadata segment is not found
+ *  -n: error
+ *      ERR_READ_FILE
+ *      ERR_WRITE_FILE
+ *      ERR_INVALID_JPEG
+ *      ERR_INVALID_APP1HEADER
+ */
+int removeAdobeMetadataSegmentFromJPEGFile(const char *inJPEGFileName,
+                                           const char *outJPGEFileName)
+{
+#define ADOBE_METADATA_ID     "http://ns.adobe.com/xap/"
+#define ADOBE_METADATA_ID_LEN 24
+
+    typedef struct _SegmentHeader {
+        unsigned short marker;
+        unsigned short length;
+    } SEGMENT_HEADER;
+
+    SEGMENT_HEADER hdr;
+    int i, sts = 1;
+    size_t readLen, writeLen;
+    unsigned int ofs;
+    unsigned char buf[8192], *p;
+    FILE *fpr = NULL, *fpw = NULL;
+
+    fpr = fopen(inJPEGFileName, "rb");
+    if (!fpr) {
+        sts = ERR_READ_FILE;
+        goto DONE;
+    }
+    sts = getApp1StartOffset(fpr, ADOBE_METADATA_ID, ADOBE_METADATA_ID_LEN, NULL);
+    if (sts <= 0) { // target segment is not exist or something error
+        goto DONE;
+    }
+    ofs = sts;
+    sts = 1;
+    fpw = fopen(outJPGEFileName, "wb");
+    if (!fpw) {
+        sts = ERR_WRITE_FILE;
+        goto DONE;
+    }
+    // copy the data in front of the App1 segment
+    rewind(fpr);
+    p = buf;
+    if (ofs > sizeof(buf)) {
+        // allocate new buffer if needed
+        p = (unsigned char*)malloc(ofs);
+    }
+    if (!p) {
+        for (i = 0; i < (int)ofs; i++) {
+            fread(buf, 1, sizeof(char), fpr);
+            fwrite(buf, 1, sizeof(char), fpw);
+        }
+    } else {
+        if (fread(p, 1, ofs, fpr) < (size_t)ofs) {
+            sts = ERR_READ_FILE;
+            goto DONE;
+        }
+        if (fwrite(p, 1, ofs, fpw) < (size_t)ofs) {
+            sts = ERR_WRITE_FILE;
+            goto DONE;
+        }
+        if (p != &buf[0]) {
+            free(p);
+        }
+    }
+    if (fread(&hdr, 1, sizeof(SEGMENT_HEADER), fpr) != sizeof(SEGMENT_HEADER)) {
+        sts = ERR_READ_FILE;
+        goto DONE;
+    }
+    if (systemIsLittleEndian()) {
+        // the segment length value is always in big-endian order
+        hdr.length = swab16(hdr.length);
+    }
+    // seek to the end of the App1 segment
+    if (fseek(fpr, hdr.length - sizeof(hdr.length), SEEK_CUR) != 0) {
+        sts = ERR_READ_FILE;
+        goto DONE;
+    }
+    // read & write
+    for (;;) {
+        readLen = fread(buf, 1, sizeof(buf), fpr);
+        if (readLen <= 0) {
+            break;
+        }
+        writeLen = fwrite(buf, 1, readLen, fpw);
+        if (writeLen != readLen) {
+            sts = ERR_WRITE_FILE;
+            goto DONE;
+        }
+    }
+DONE:
+    if (fpw) {
+        fclose(fpw);
+    }
+    if (fpr) {
+        fclose(fpr);
+    }
+    return sts;
+}
 
 // private functions
 
@@ -798,18 +1497,21 @@ static char *getTagName(int ifdType, unsigned short tagId)
     return tagName;
 }
 
-// create IFD table
+// create the IFD table
 static void *createIfdTable(IFD_TYPE IfdType, unsigned short tagCount, unsigned int nextOfs)
 {
     IfdTable *ifd = (IfdTable*)malloc(sizeof(IfdTable));
+    if (!ifd) {
+        return NULL;
+    }
+    memset(ifd, 0, sizeof(IfdTable));
     ifd->ifdType = IfdType;
     ifd->tagCount = tagCount;
-    ifd->tags = NULL;
     ifd->nextIfdOffset = nextOfs;
     return ifd;
 }
 
-// add tag enrtry to the IFD table
+// add the TagNode enrtry to the IFD table
 static void *addTagNodeToIfd(void *pIfd,
                       unsigned short tagId,
                       unsigned short type,
@@ -920,6 +1622,9 @@ static void freeIfdTable(void *pIfd)
         return;
     }
     tag = ifd->tags;
+    if (ifd->p) {
+        free(ifd->p);
+    }
     free(ifd);
 
     if (tag) {
@@ -950,6 +1655,587 @@ static TagNode *getTagNodePtrFromIfd(IfdTable *ifd, unsigned short tagId)
         tag = tag->next;
     }
     return NULL;
+}
+
+// remove the TagNode entry from the IFD table
+static int removeTagOnIfd(void *pIfd, unsigned short tagId)
+{
+    int num = 0;
+    IfdTable *ifd = (IfdTable*)pIfd;
+    TagNode *tag;
+    if (!ifd) {
+        return 0;
+    }
+    for (;;) { // possibility of multiple entries
+        tag = getTagNodePtrFromIfd(ifd, tagId);
+        if (!tag) {
+            break; // no more found
+        }
+        num++;
+        if (tag->prev) {
+            tag->prev->next = tag->next;
+        } else {
+            ifd->tags = tag->next;
+        }
+        if (tag->next) {
+            tag->next->prev = tag->prev;
+        }
+        freeTagNode(tag);
+        ifd->tagCount--;
+    }
+    return num;
+}
+
+// get the IFD table address of the specified type
+static IfdTable *getIfdTableFromIfdTableArray(void **ifdTableArray, IFD_TYPE ifdType)
+{
+    int i;
+    if (!ifdTableArray) {
+        return NULL;
+    }
+    for (i = 0; ifdTableArray[i] != NULL; i++) {
+        IfdTable *ifd = ifdTableArray[i];
+        if (ifd->ifdType == ifdType) {
+            return ifd;
+        }
+    }
+    return NULL;
+}
+
+// count IFD tables
+static int countIfdTableOnIfdTableArray(void **ifdTableArray)
+{
+    int i, num = 0;
+    for (i = 0; ifdTableArray[i] != NULL; i++) {
+        num++;
+    }
+    return num;
+}
+
+// set single numeric value to the existing TagNode entry
+static int setSingleNumDataToTag(TagNode *tag, unsigned int value)
+{
+    if (!tag) {
+        return 0;
+    }
+    if (tag->type != TYPE_BYTE   &&
+        tag->type != TYPE_SHORT  &&
+        tag->type != TYPE_LONG   &&
+        tag->type != TYPE_SBYTE  &&
+        tag->type != TYPE_SSHORT &&
+        tag->type != TYPE_SLONG) {
+        return 0;
+    }
+    if (!tag->numData) {
+        tag->numData = (unsigned int*)malloc(sizeof(int));
+    }
+    tag->count = 1;
+    tag->numData[0] = value;
+    tag->error = 0;
+    return 1;
+}
+
+/**
+ * write the Exif segment to the file
+ *
+ * parameters
+ *  [in] fp: the output file pointer
+ *  [in] ifdTableArray: address of the IFD tables array
+ *
+ * return
+ *  0: OK
+ *  ERR_WRITE_FILE
+ */
+static int writeExifSegment(FILE *fp, void **ifdTableArray)
+{
+#define IFDMAX 5
+
+    union _packed {
+        unsigned int ui;
+        unsigned short us[2];
+        unsigned char uc[4];
+    };
+
+    IfdTable *ifds[IFDMAX], *ifd0th;
+    TagNode *tag;
+    IFD_TAG tagField;
+    unsigned short num, us;
+    unsigned int ui;
+    int zero = 0;
+    int i, x;
+    unsigned int ofs;
+    union _packed packed;
+    APP1_HEADER dupApp1Header = App1Header;
+
+    ifds[0] = getIfdTableFromIfdTableArray(ifdTableArray, IFD_0TH);
+    ifds[1] = getIfdTableFromIfdTableArray(ifdTableArray, IFD_EXIF);
+    ifds[2] = getIfdTableFromIfdTableArray(ifdTableArray, IFD_IO);
+    ifds[3] = getIfdTableFromIfdTableArray(ifdTableArray, IFD_GPS);
+    ifds[4] = getIfdTableFromIfdTableArray(ifdTableArray, IFD_1ST);
+    ifd0th = ifds[0];
+
+    // return if 0th IFD is not exist
+    if (!ifd0th) {
+        return 0;
+    }
+    // get total length of the segment
+    us = sizeof(APP1_HEADER) - sizeof(short);
+    for (x = 0; x < IFDMAX; x++) {
+        if (ifds[x]) {
+            us = us + ifds[x]->length;
+        }
+    }
+    // segment length must be written in big-endian
+    if (systemIsLittleEndian()) {
+        us = swab16(us);
+    }
+    dupApp1Header.length = us;
+    dupApp1Header.tiff.reserved = fix_short(dupApp1Header.tiff.reserved);
+    dupApp1Header.tiff.Ifd0thOffset = fix_int(dupApp1Header.tiff.Ifd0thOffset);
+    // write Exif segment Header
+    if (fwrite(&dupApp1Header, 1, sizeof(APP1_HEADER), fp) != sizeof(APP1_HEADER)) {
+        return ERR_WRITE_FILE;
+    }
+
+    // base offset of the Exif segment
+    ofs = sizeof(TIFF_HEADER);
+    for (x = 0; x < IFDMAX; x++) {
+        IfdTable *ifd = ifds[x];
+        if (ifd == NULL) {
+            continue;
+        }
+        // calculate the start offset to write the tag's data of this IFD
+        ofs += sizeof(short) + // sizeof the tag number area
+               sizeof(IFD_TAG) * ifd->tagCount + // sizeof the tag fields
+               sizeof(int);    // sizeof the NextOffset area
+
+        // write actual tag number of the current IFD
+        num = 0;
+        tag = ifd->tags;
+        while (tag) {
+            if (!tag->error) {
+                num++;
+            }
+            tag = tag->next;
+        }
+        us = fix_short(num);
+        if (fwrite(&us, 1, sizeof(short), fp) != sizeof(short)) {
+            return ERR_WRITE_FILE;
+        }
+
+        // write the each tag fields
+        tag = ifd->tags;
+        while (tag) {
+            if (tag->error) {
+                tag = tag->next; // ignore
+                continue;
+            }
+            tagField.tag = fix_short(tag->tagId);
+            tagField.type = fix_short(tag->type);
+            tagField.count = fix_int(tag->count);
+            packed.ui = 0;
+
+            switch (tag->type) {
+            case TYPE_ASCII:
+            case TYPE_UNDEFINED:
+                if (tag->count <= 4) {
+                    for (i = 0; i < (int)tag->count; i++) {
+                        packed.uc[i] = tag->byteData[i];
+                    }
+                } else {
+                    packed.ui = fix_int(ofs);
+                    ofs += tag->count;
+                    if (tag->count % 2 != 0) {
+                        ofs++;
+                    }
+                }
+                break;
+            case TYPE_BYTE:
+            case TYPE_SBYTE:
+                if (tag->count <= 4) {
+                    for (i = 0; i < (int)tag->count; i++) {
+                        packed.uc[i] = (unsigned char)tag->numData[i];
+                    }
+                } else {
+                    packed.ui = fix_int(ofs);
+                    ofs += tag->count;
+                    if (tag->count % 2 != 0) {
+                        ofs++;
+                    }
+                }
+                break;
+            case TYPE_SHORT:
+            case TYPE_SSHORT:
+                if (tag->count <= 2) {
+                    for (i = 0; i < (int)tag->count; i++) {
+                        packed.us[i] = fix_short((unsigned short)tag->numData[i]);
+                    }
+                } else {
+                    packed.ui = fix_int(ofs);
+                    ofs += tag->count * sizeof(short);
+                }
+                break;
+            case TYPE_LONG:
+            case TYPE_SLONG:
+                if (tag->count <= 1) {
+                    packed.ui = fix_int((unsigned int)tag->numData[0]);
+                } else {
+                    packed.ui = fix_int(ofs);
+                    ofs += tag->count * sizeof(short);
+                }
+                break;
+            case TYPE_RATIONAL:
+            case TYPE_SRATIONAL:
+                packed.ui = fix_int(ofs);
+                ofs += tag->count * sizeof(int) * 2;
+                break;
+            }
+            tagField.offset = packed.ui;
+            if (fwrite(&tagField, 1, sizeof(tagField), fp) != sizeof(tagField)) {
+                return ERR_WRITE_FILE;
+            }
+            tag = tag->next;
+        }
+        ui = fix_int(ifd->nextIfdOffset);
+        if (fwrite(&ui, 1, sizeof(int), fp) != sizeof(int)) {
+            return ERR_WRITE_FILE;
+        }
+
+        // write the tag values over 4 bytes 
+        tag = ifd->tags;
+        while (tag) {
+            if (tag->error) {
+                tag = tag->next;
+                continue;
+            }
+            switch (tag->type) {
+            case TYPE_ASCII:
+            case TYPE_UNDEFINED:
+                if (tag->count > 4) {
+                    if (fwrite(tag->byteData, 1, tag->count, fp) != tag->count) {
+                        return ERR_WRITE_FILE;
+                    }
+                    if (tag->count % 2 != 0) { // for even boundary
+                        if (fwrite(&zero, 1, sizeof(char), fp) != sizeof(char)) {
+                            return ERR_WRITE_FILE;
+                        }
+                    }
+                }
+                break;
+            case TYPE_BYTE:
+            case TYPE_SBYTE:
+                if (tag->count > 4) {
+                    for (i = 0; i < (int)tag->count; i++) {
+                        unsigned char n = (unsigned char)tag->numData[i];
+                        if (fwrite(&n, 1, sizeof(char), fp) != sizeof(char)) {
+                            return ERR_WRITE_FILE;
+                        }
+
+                    }
+                    if (tag->count % 2 != 0) {
+                        if (fwrite(&zero, 1, sizeof(char), fp) != sizeof(char)) {
+                            return ERR_WRITE_FILE;
+                        }
+                    }
+                }
+                break;
+            case TYPE_SHORT:
+            case TYPE_SSHORT:
+                if (tag->count > 2) {
+                    for (i = 0; i < (int)tag->count; i++) {
+                        unsigned short n = fix_short((unsigned short)tag->numData[i]);
+                        if (fwrite(&n, 1, sizeof(short), fp) != sizeof(short)) {
+                            return ERR_WRITE_FILE;
+                        }
+                    }
+                }
+                break;
+            case TYPE_LONG:
+            case TYPE_SLONG:
+                if (tag->count > 1) {
+                    for (i = 0; i < (int)tag->count; i++) {
+                        unsigned int n = fix_int((unsigned int)tag->numData[i]);
+                        if (fwrite(&n, 1, sizeof(int), fp) != sizeof(int)) {
+                            return ERR_WRITE_FILE;
+                        }
+                    }
+                }
+                break;
+            case TYPE_RATIONAL:
+            case TYPE_SRATIONAL:
+                for (i = 0; i < (int)tag->count*2; i++) {
+                    unsigned int n = fix_int((unsigned int)tag->numData[i]);
+                    if (fwrite(&n, 1, sizeof(int), fp) != sizeof(int)) {
+                        return ERR_WRITE_FILE;
+                    }
+                }
+                break;
+            }
+            tag = tag->next;
+        }
+        // write the thumbnail data in the 1st IFD
+        if (ifd->ifdType == IFD_1ST && ifd->p != NULL) {
+            tag = getTagNodePtrFromIfd(ifd, TAG_JPEGInterchangeFormatLength);
+            if (tag) {
+                if (tag->numData[0] > 0) {
+                    if (fwrite(ifd->p, 1, tag->numData[0], fp) != tag->numData[0]) {
+                        return ERR_WRITE_FILE;
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// calculate the actual length of the IFD
+static unsigned short calcIfdSize(void *pIfd)
+{
+    unsigned int size, num = 0;
+    TagNode *tag;
+    IfdTable *ifd = (IfdTable*)pIfd;
+    if (!ifd) {
+        return 0;
+    }
+    // count the actual tag number
+    tag = ifd->tags;
+    while (tag) {
+        if (!tag->error) {
+            num++;
+        }
+        tag = tag->next;
+    }
+
+    size = sizeof(short) + // sizeof the tag number area
+           sizeof(IFD_TAG) * num + // sizeof tag fields
+           sizeof(int); // sizeof the NextOffset area
+
+    // add thumbnail data length
+    if (ifd->ifdType == IFD_1ST) {
+        if (ifd->p) {
+            tag = getTagNodePtrFromIfd(ifd, TAG_JPEGInterchangeFormatLength);
+            if (tag) {
+                size += tag->numData[0];
+            }
+        }
+    }
+    tag = ifd->tags;
+    while (tag) {
+        if (tag->error) {
+            // ignore
+            tag = tag->next;
+            continue;
+        }
+        switch (tag->type) {
+        case TYPE_ASCII:
+        case TYPE_UNDEFINED:
+        case TYPE_BYTE:
+        case TYPE_SBYTE:
+            if (tag->count > 4) {
+                size += tag->count;
+                if (tag->count % 2 != 0) {
+                    // padding for even byte boundary
+                    size += 1;
+                }
+            }
+            break;
+        case TYPE_SHORT:
+        case TYPE_SSHORT:
+            if (tag->count > 2) {
+                size += tag->count * sizeof(short);
+            }
+            break;
+        case TYPE_LONG:
+        case TYPE_SLONG:
+            if (tag->count > 1) {
+                size += tag->count * sizeof(int);
+            }
+            break;
+        case TYPE_RATIONAL:
+        case TYPE_SRATIONAL:
+            if (tag->count > 0) {
+                size += tag->count * sizeof(int) * 2;
+            }
+            break;
+        }
+        tag = tag->next;
+    }
+    return (unsigned short)size;
+}
+
+/**
+ * refresh the length and offset variables in the IFD tables
+ *
+ * parameters
+ *  [in/out] ifdTableArray: address of the IFD tables array
+ *
+ * return
+ *  0: OK
+ *  ERR_INVALID_POINTER
+ *  ERROR_UNKNOWN
+ */
+static int fixLengthAndOffsetInIfdTables(void **ifdTableArray)
+{
+    int i;
+    TagNode *tag, *tagwk;
+    unsigned short num;
+    unsigned short ofsBase = sizeof(TIFF_HEADER);
+    unsigned int len, dummy = 0, again = 0;
+    IfdTable *ifd0th, *ifdExif, *ifdIo, *ifdGps, *ifd1st; 
+    if (!ifdTableArray) {
+        return ERR_INVALID_POINTER;
+    }
+
+AGAIN:
+    // calculate the length of the each IFD tables.
+    for (i = 0; ifdTableArray[i] != NULL; i++) {
+        IfdTable *ifd = ifdTableArray[i];
+        // count the actual tag number
+        tag = ifd->tags;
+        num = 0;
+        while (tag) {
+            // ignore and dispose the error tag
+            if (tag->error) {
+                tagwk = tag->next;
+                if (tag->prev) {
+                    tag->prev->next = tag->next;
+                } else {
+                    ifd->tags = tag->next;
+                }
+                if (tag->next) {
+                    tag->next->prev = tag->prev;
+                }
+                freeTagNode(tag);
+                tag = tagwk;
+                continue;
+            }
+            num++;
+            tag = tag->next;
+        }
+        ifd->tagCount = num;
+        ifd->length = calcIfdSize(ifd);
+        ifd->nextIfdOffset = 0;
+    }
+    ifd0th  = getIfdTableFromIfdTableArray(ifdTableArray, IFD_0TH);
+    ifdExif = getIfdTableFromIfdTableArray(ifdTableArray, IFD_EXIF);
+    ifdIo   = getIfdTableFromIfdTableArray(ifdTableArray, IFD_IO);
+    ifdGps  = getIfdTableFromIfdTableArray(ifdTableArray, IFD_GPS);
+    ifd1st  = getIfdTableFromIfdTableArray(ifdTableArray, IFD_1ST);
+
+    if (!ifd0th) {
+        return 0; // not error
+    }
+    ifd0th->offset = ofsBase;
+
+    // set "NextOffset" variable in the 0th IFD if the 1st IFD is exist
+    if (ifd1st) {
+        ifd0th->nextIfdOffset =
+                ofsBase +
+                ifd0th->length + 
+                ((ifdExif)? ifdExif->length : 0) +
+                ((ifdIo)? ifdIo->length : 0) +
+                ((ifdGps)? ifdGps->length : 0);
+        ifd1st->offset = (unsigned short)ifd0th->nextIfdOffset;
+
+        // set the offset value of the thumbnail data
+        if (ifd1st->p) {
+            tag = getTagNodePtrFromIfd(ifd1st, TAG_JPEGInterchangeFormatLength);
+            if (tag) {
+                len = tag->numData[0]; // thumbnail length;
+                tag = getTagNodePtrFromIfd(ifd1st, TAG_JPEGInterchangeFormat);
+                if (tag) {
+                    // set the offset value
+                    setSingleNumDataToTag(tag, ifd1st->offset + ifd1st->length - len);
+                } else {
+                    // create the JPEGInterchangeFormat tag if not exist
+                    if (!addTagNodeToIfd(ifd1st, TAG_JPEGInterchangeFormat, 
+                        TYPE_LONG, 1, &dummy, NULL)) {
+                        return ERR_UNKNOWN;
+                    }
+                    again = 1;
+                }
+            } else {
+                tag = getTagNodePtrFromIfd(ifd1st, TAG_JPEGInterchangeFormat);
+                if (tag) {
+                    setSingleNumDataToTag(tag, 0);
+                }
+            }
+        }
+    } else {
+        ifd0th->nextIfdOffset = 0; // 1st IFD is not exist
+    }
+
+    // set "ExifIFDPointer" tag value in the 0th IFD if the Exif IFD is exist
+    if (ifdExif) {
+        tag = getTagNodePtrFromIfd(ifd0th, TAG_ExifIFDPointer);
+        if (tag) {
+            setSingleNumDataToTag(tag, ofsBase + ifd0th->length);
+            ifdExif->offset = (unsigned short)tag->numData[0];
+        } else {
+            // create the tag if not exist
+            if (!addTagNodeToIfd(ifd0th, TAG_ExifIFDPointer, TYPE_LONG, 1,
+                                    &dummy, NULL)) {
+                return ERR_UNKNOWN;
+            }
+            again = 1;
+        }
+        // set "InteroperabilityIFDPointer" tag value in the Exif IFD
+        // if the Interoperability IFD is exist
+        if (ifdIo) {
+            tag = getTagNodePtrFromIfd(ifdExif, TAG_InteroperabilityIFDPointer);
+            if (tag) {
+                setSingleNumDataToTag(tag, ofsBase + ifd0th->length + ifdExif->length);
+                ifdIo->offset = (unsigned short)tag->numData[0];
+            } else {
+                // create the tag if not exist
+                if (!addTagNodeToIfd(ifdExif, TAG_InteroperabilityIFDPointer,
+                                        TYPE_LONG, 1, &dummy, NULL)) {
+                    return ERR_UNKNOWN;
+                }
+                again = 1;
+            }
+        } else {
+            tag = getTagNodePtrFromIfd(ifdExif, TAG_InteroperabilityIFDPointer);
+            if (tag) {
+                setSingleNumDataToTag(tag, 0);
+            }
+        }
+    } else { // Exif 
+        tag = getTagNodePtrFromIfd(ifd0th, TAG_ExifIFDPointer);
+        if (tag) {
+            setSingleNumDataToTag(tag, 0);
+        }
+    }
+
+    // set "GPSInfoIFDPointer" tag value in the 0th IFD if the GPS IFD is exist
+    if (ifdGps) {
+        tag = getTagNodePtrFromIfd(ifd0th, TAG_GPSInfoIFDPointer);
+        if (tag) {
+            setSingleNumDataToTag(tag, ofsBase +
+                                        ifd0th->length + 
+                                        ((ifdExif)? ifdExif->length : 0) +
+                                        ((ifdIo)? ifdIo->length : 0));
+            ifdGps->offset = (unsigned short)tag->numData[0];
+        } else {
+            // create the tag if not exist
+            if (!addTagNodeToIfd(ifd0th, TAG_GPSInfoIFDPointer, TYPE_LONG,
+                                1, &dummy, NULL)) {
+                return ERR_UNKNOWN;
+            }
+            again = 1;
+        }
+    } else { // GPS IFD is not exist
+        tag = getTagNodePtrFromIfd(ifd0th, TAG_GPSInfoIFDPointer);
+        if (tag) {
+            setSingleNumDataToTag(tag, 0);
+        }
+    }
+    // repeat again if needed
+    if (again) {
+        again = 0;
+        goto AGAIN;
+    }
+    return 0;
 }
 
 /**
@@ -1154,12 +2440,59 @@ static void *parseIFD(FILE *fp,
              }
          }
     }
+    if (ifdType == IFD_1ST) {
+        // get thumbnail data
+        unsigned int thumbnail_ofs = 0, thumbnail_len;
+        IfdTable *ifdTable = (IfdTable*)ifd;
+        TagNode *tag  = getTagNodePtrFromIfd(ifd, TAG_JPEGInterchangeFormat);
+        if (tag) {
+            thumbnail_ofs = tag->numData[0];
+        }
+        if (thumbnail_ofs > 0) {
+            tag = getTagNodePtrFromIfd(ifd, TAG_JPEGInterchangeFormatLength);
+            if (tag) {
+                thumbnail_len = tag->numData[0];
+                if (thumbnail_len > 0) {
+                    ifdTable->p = (unsigned char*)malloc(thumbnail_len);
+                    if (ifdTable->p) {
+                        if (seekToRelativeOffset(fp, thumbnail_ofs) == 0) {
+                            if (fread(ifdTable->p, 1, thumbnail_len, fp)
+                                                        != thumbnail_len) {
+                                free(ifdTable->p);
+                                ifdTable->p = NULL;
+                            } else {
+                                // for test
+                                //FILE *fpw = fopen("thumbnail.jpg", "wb");
+                                //fwrite(ifdTable->p, 1, thumbnail_len, fpw);
+                                //fclose(fpw);
+                            }
+                        } else {
+                            free(ifdTable->p);
+                            ifdTable->p = NULL;
+                        }
+                    }
+                }
+            }
+        }
+    }
     return ifd;
 ERR:
     if (ifd) {
         freeIfdTable(ifd);
     }
     return NULL;
+}
+
+
+void setDefaultApp1SegmentHader()
+{
+    memset(&App1Header, 0, sizeof(APP1_HEADER));
+    App1Header.marker = (systemIsLittleEndian()) ? 0xE1FF : 0xFFE1;
+    App1Header.length = 0;
+    strcpy(App1Header.id, "Exif");
+    App1Header.tiff.byteOrder = 0x4949; // means little-endian
+    App1Header.tiff.reserved = 0x002A;
+    App1Header.tiff.Ifd0thOffset = 0x00000008;
 }
 
 /**
@@ -1204,7 +2537,10 @@ static int readApp1SegmentHeader(FILE *fp)
  *   0: the Exif segment is not found
  *  -n: error
  */
-static int getApp1StartOffset(FILE *fp)
+static int getApp1StartOffset(FILE *fp,
+                              const char *App1IDString,
+                              size_t App1IDStringLength,
+                              int *pDQTOffset)
 {
     #define EXIF_ID_STR     "Exif\0"
     #define EXIF_ID_STR_LEN 5
@@ -1237,6 +2573,9 @@ static int getApp1StartOffset(FILE *fp)
     // if DQT marker (0xFFDB) is appeared, the application segment
     // doesn't exist
     if (marker == 0xFFDB) {
+        if (pDQTOffset != NULL) {
+            *pDQTOffset = ftell(fp) - sizeof(short);
+        }
         return 0; // not found the Exif segment
     }
 
@@ -1244,6 +2583,10 @@ static int getApp1StartOffset(FILE *fp)
     for (;;) {
         // unexpected value. is not a APP[0-14] marker
         if (!(marker >= 0xFFE0 && marker <= 0xFFEF)) {
+            // found DQT
+            if (marker == 0xFFDB && pDQTOffset != NULL) {
+                *pDQTOffset = pos - sizeof(short);
+            }
             break;
         }
         // read the length of the segment
@@ -1260,10 +2603,10 @@ static int getApp1StartOffset(FILE *fp)
             }
         } else {
             // check if it is the Exif segment
-            if (fread(&buf, 1, EXIF_ID_STR_LEN, fp) < EXIF_ID_STR_LEN) {
+            if (fread(&buf, 1, App1IDStringLength, fp) < App1IDStringLength) {
                 return ERR_READ_FILE;
             }
-            if (memcmp(buf, EXIF_ID_STR, EXIF_ID_STR_LEN) == 0) {
+            if (memcmp(buf, App1IDString, App1IDStringLength) == 0) {
                 // return the start offset of the Exif segment
                 return pos - sizeof(short);
             }
@@ -1295,15 +2638,47 @@ static int getApp1StartOffset(FILE *fp)
  */
 static int init(FILE *fp)
 {
-    int sts;
+    int sts, dqtOffset = -1;;
+    setDefaultApp1SegmentHader();
     // get the offset of the Exif segment
-    if ((sts = getApp1StartOffset(fp)) <= 0) {
+    sts = getApp1StartOffset(fp, EXIF_ID_STR, EXIF_ID_STR_LEN, &dqtOffset);
+    if (sts < 0) { // error
         return sts;
     }
+    JpegDQTOffset = dqtOffset;
     App1StartOffset = sts;
+    if (sts == 0) {
+        return sts;
+    }
     // Load the segment header
     if (!readApp1SegmentHeader(fp)) {
         return ERR_INVALID_APP1HEADER;
     }
     return 1;
+}
+
+static void PRINTF(char **ms, const char *fmt, ...) {
+    char buf[4096];
+    char *p = NULL;
+    int len, cnt;
+    va_list args;
+    va_start(args, fmt);
+    cnt = vsnprintf(buf, sizeof(buf)-1, fmt, args);
+    if (!ms) {
+        printf("%s", buf);
+        return;
+    }
+    else if (*ms) {
+        len = (int)(strlen(*ms) + cnt + 1);
+        p = (char*)malloc(len);
+        strcpy(p, *ms);
+        strcat(p, buf);
+        free(*ms);
+    } else {
+        len = cnt + 1;
+        p = (char*)malloc(len);
+        strcpy(p, buf);
+    }
+    *ms = p;
+    va_end(args);
 }
